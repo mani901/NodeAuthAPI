@@ -209,7 +209,6 @@ curl -X POST http://localhost:5000/api/auth/register \
 - Add email verification for new users.
 - Implement role-based access control (RBAC).
 - Add logging middleware for debugging.
-- Deploy to a platform like Heroku or Vercel.
 
 ## Contributing
 Feel free to fork this repository, submit issues, or create pull requests. Contributions are welcome!
