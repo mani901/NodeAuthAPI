@@ -14,7 +14,7 @@ A robust authentication API built with Node.js, Express.js, MongoDB, and JWT (JS
 ## Tech Stack
 - **Node.js**: Server-side runtime.
 - **Express.js**: Web framework for building the API.
-- **MongoDB**: NoSQL database for storing user data.
+- **MongoDB**: NoSQL database for storing user data efficient.
 - **Mongoose**: ODM for MongoDB.
 - **JWT**: Token-based authentication.
 - **Bcryptjs**: Password hashing.
