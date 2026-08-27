@@ -1,0 +1,311 @@
+name: clean-verify-personal
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        default: true
+        description: "true = report only, false = commit + push fixes"
+      remove_vscode_entirely:
+        type: boolean
+        default: false
+        description: "delete every .vscode/ file in every repo/branch (nuclear option)"
+      repo_filter:
+        type: string
+        default: ""
+        description: "optional regex - only scan repos whose name matches"
+      include_private:
+        type: boolean
+        default: true
+        description: "true = scan private repos too, false = public only"
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PERSONAL_CLEAN_TOKEN }}
+      DRY: ${{ inputs.dry_run }}
+      NUKE_VSCODE: ${{ inputs.remove_vscode_entirely }}
+      REPO_FILTER: ${{ inputs.repo_filter }}
+      INCLUDE_PRIVATE: ${{ inputs.include_private }}
+      SELF_WORKFLOW: clean-verify-personal.yml   # scanner skips this file (it contains the signatures)
+    steps:
+      - name: Write scanner
+        shell: bash
+        run: |
+          cat > /tmp/scan.py <<'PY'
+          #!/usr/bin/env python3
+          # Malware scanner/remover for the "A10 / eth.blockscout / .vscode folderOpen" campaign.
+          # usage: scan.py <root> <repo> <branch> <dry:true|false> [nuke_vscode:true|false]
+          import os, re, sys, json
+
+          ROOT, REPO, BRANCH = sys.argv[1], sys.argv[2], sys.argv[3]
+          DRY = sys.argv[4].lower() == "true"
+          NUKE_VSCODE = len(sys.argv) > 5 and sys.argv[5].lower() == "true"
+          SELF = os.environ.get("SELF_WORKFLOW", "clean-verify-personal.yml")
+          MAX_BYTES = 25 * 1024 * 1024
+
+          ANCHOR  = re.compile(rb'global\.i="A10')
+          STRIP   = re.compile(rb'(?:[ \t]{200,})?global\.i="A10.*\Z', re.S)
+          MARKERS = re.compile(rb'global\.i="A10|/0x/cls|/0x/ls|x-payload-b64|eth\.blockscout|\b_t_s\b|\b_t_u\b|"Sec-V"|temp_auto_push|temp_interactive_push')
+          GITIGN  = re.compile(r'temp_auto_push|temp_interactive_push|config\.bat')
+          # node executing something that is not a script  (node ./public/fonts/fa-solid-400.woff2)
+          BADCMD  = re.compile(
+              r'\bnode(?:\.exe)?\b[^\n"]*?\.(?:woff2?|ttf|otf|eot|png|jpe?g|gif|svg|ico|webp|bmp|wasm|css|txt|md|bin|dat|map)\b'
+              r'|where node >nul 2>&1 && node', re.I)
+          BOTFILE = re.compile(r'^(temp_auto_push|temp_interactive_push)(\..*)?$|^config\.bat$', re.I)
+
+          JS_EXT    = {'.js', '.mjs', '.cjs', '.ts', '.jsx', '.tsx', '.mts', '.cts'}
+          ASSET_EXT = {'.woff', '.woff2', '.ttf', '.otf', '.eot', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico',
+                       '.webp', '.bmp', '.wasm', '.mp3', '.mp4', '.pdf', '.bin', '.dat'}
+          REVIEW_EXT = {'.yml', '.yaml', '.sh', '.bat', '.ps1', '.cmd'}
+
+          found = 0  # anything detected (dry or not)
+
+          def log(status, p, note=""):
+              global found
+              found += 1
+              tag = ("WOULD-" + status) if DRY else status
+              print(f"{tag}: {REPO}@{BRANCH}/{p}" + (f"  :: {note}" if note else ""), flush=True)
+
+          def write(path, data):
+              if DRY: return
+              with open(path, "wb") as f: f.write(data)
+
+          def delete(path):
+              if DRY: return
+              os.remove(path)
+
+          def strip_jsonc(s):
+              if s.startswith("\ufeff"): s = s[1:]
+              out, i, n, instr = [], 0, len(s), False
+              while i < n:
+                  c = s[i]
+                  if instr:
+                      out.append(c)
+                      if c == '\\' and i + 1 < n: out.append(s[i+1]); i += 2; continue
+                      if c == '"': instr = False
+                      i += 1; continue
+                  if c == '"': instr = True; out.append(c); i += 1; continue
+                  if s.startswith('//', i): j = s.find('\n', i); i = n if j < 0 else j; continue
+                  if s.startswith('/*', i): j = s.find('*/', i + 2); i = n if j < 0 else j + 2; continue
+                  out.append(c); i += 1
+              t = ''.join(out)
+              return re.sub(r',(\s*[\]}])', r'\1', t)
+
+          def task_is_bad(t):
+              if not isinstance(t, dict): return False
+              blob = json.dumps(t)
+              if BADCMD.search(blob) or MARKERS.search(blob.encode()): return True
+              ro = t.get("runOptions") or {}
+              if isinstance(ro, dict) and ro.get("runOn") == "folderOpen":
+                  pres = t.get("presentation") or {}
+                  if t.get("hide") is True or (isinstance(pres, dict) and pres.get("reveal") == "never"):
+                      return True
+              return False
+
+          def clean_json_tree(obj):
+              """Remove bad tasks from any 'tasks' list and the auto-task setting anywhere. Returns (obj, removed_notes)."""
+              notes = []
+              if isinstance(obj, dict):
+                  if isinstance(obj.get("tasks"), list):
+                      keep = []
+                      for t in obj["tasks"]:
+                          if task_is_bad(t):
+                              notes.append("task '%s'" % (t.get("label") or t.get("command", "?"))[:60])
+                          else:
+                              keep.append(t)
+                      obj["tasks"] = keep
+                  if obj.get("task.allowAutomaticTasks") in ("on", True):
+                      del obj["task.allowAutomaticTasks"]; notes.append("task.allowAutomaticTasks=on")
+                  if isinstance(obj.get("scripts"), dict):  # package.json
+                      for k, v in list(obj["scripts"].items()):
+                          if isinstance(v, str) and (BADCMD.search(v) or MARKERS.search(v.encode())):
+                              del obj["scripts"][k]; notes.append(f"scripts.{k}")
+                  for k, v in list(obj.items()):
+                      if isinstance(v, (dict, list)):
+                          obj[k], sub = clean_json_tree(v); notes += sub
+              elif isinstance(obj, list):
+                  for i, v in enumerate(obj):
+                      if isinstance(v, (dict, list)):
+                          obj[i], sub = clean_json_tree(v); notes += sub
+              return obj, notes
+
+          def json_is_effectively_empty(obj):
+              if not isinstance(obj, dict): return False
+              return all(k == "version" or (k == "tasks" and obj[k] == []) or (isinstance(obj[k], dict) and not obj[k]) for k in obj)
+
+          def handle_json(path, rel, raw, kind):
+              text = raw.decode("utf-8", "replace")
+              suspicious = bool(BADCMD.search(text) or MARKERS.search(raw) or '"folderOpen"' in text or "allowAutomaticTasks" in text)
+              try:
+                  obj = json.loads(strip_jsonc(text))
+              except Exception as e:
+                  if suspicious:
+                      log(f"{kind}-DELETED-UNPARSEABLE", rel, "suspicious content but JSON could not be parsed; restore legit parts from git history if needed")
+                      delete(path)
+                  return
+              obj, notes = clean_json_tree(obj)
+              if not notes: return
+              if kind != "PKG" and json_is_effectively_empty(obj):
+                  log(f"{kind}-DELETED", rel, "; ".join(notes) + " (nothing legit left)")
+                  delete(path)
+              else:
+                  log(f"{kind}-CLEANED", rel, "; ".join(notes))
+                  write(path, (json.dumps(obj, indent=2, ensure_ascii=False) + "\n").encode())
+
+          def looks_like_js_text(raw):
+              head = raw[:4096].lstrip()
+              return head[:1].isascii() and (b"require(" in raw[:20000] or ANCHOR.search(raw[:20000]) or head.startswith(b"global."))
+
+          for dirpath, dirnames, filenames in os.walk(ROOT):
+              dirnames[:] = [d for d in dirnames if d != ".git"]
+              for name in filenames:
+                  path = os.path.join(dirpath, name)
+                  rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
+                  if os.path.islink(path): continue
+                  if rel.endswith("/" + SELF) or rel == SELF: continue  # don't eat ourselves
+
+                  if BOTFILE.match(name):
+                      log("BOT-FILE-DELETED", rel); delete(path); continue
+
+                  try:
+                      if os.path.getsize(path) > MAX_BYTES: continue
+                      with open(path, "rb") as f: raw = f.read()
+                  except OSError:
+                      continue
+                  ext = os.path.splitext(name)[1].lower()
+                  in_vscode = rel.startswith(".vscode/") or "/.vscode/" in rel
+
+                  # ---- .vscode ----
+                  if in_vscode:
+                      if NUKE_VSCODE:
+                          log("VSCODE-DELETED", rel, "remove_vscode_entirely=true"); delete(path); continue
+                      if ext == ".json":
+                          handle_json(path, rel, raw, "VSCODE"); continue
+                      if MARKERS.search(raw) or BADCMD.search(raw.decode("utf-8", "replace")):
+                          log("REVIEW-BY-HAND", rel, "non-json file in .vscode with suspicious content")
+                      continue
+
+                  if name.endswith(".code-workspace"):
+                      handle_json(path, rel, raw, "WORKSPACE"); continue
+
+                  if name == "package.json":
+                      handle_json(path, rel, raw, "PKG"); continue
+
+                  if name == ".gitignore":
+                      lines = raw.decode("utf-8", "replace").splitlines()
+                      keep = [l for l in lines if not GITIGN.search(l)]
+                      if len(keep) != len(lines):
+                          log("GITIGNORE-CLEANED", rel, f"removed {len(lines)-len(keep)} bot line(s)")
+                          write(path, ("\n".join(keep) + ("\n" if keep else "")).encode())
+                      continue
+
+                  # ---- JS/TS source: strip appended payload ----
+                  if ext in JS_EXT:
+                      if ANCHOR.search(raw):
+                          clean = STRIP.sub(b"", raw)
+                          if clean.strip() == b"":
+                              log("JS-WHOLE-FILE-PAYLOAD-DELETED", rel, "file contained ONLY the payload; if this was a real source file restore it from an older commit")
+                              delete(path)
+                          elif ANCHOR.search(clean):
+                              log("REVIEW-BY-HAND", rel, "payload marker appears mid-file, not at end")
+                          else:
+                              log("JS-PAYLOAD-STRIPPED", rel, f"{len(raw)-len(clean)} bytes removed")
+                              write(path, clean)
+                      elif MARKERS.search(raw):
+                          log("REVIEW-BY-HAND", rel, "secondary marker without A10 anchor: " + MARKERS.search(raw).group(0).decode("utf-8","replace"))
+                      continue
+
+                  # ---- assets that are really JS (fa-solid-400.woff2 trick) ----
+                  if ext in ASSET_EXT:
+                      if ANCHOR.search(raw) or looks_like_js_text(raw):
+                          log("FAKE-ASSET-PAYLOAD-DELETED", rel, "binary asset containing JavaScript")
+                          delete(path)
+                      continue
+
+                  # ---- everything else ----
+                  if ANCHOR.search(raw):
+                      clean = STRIP.sub(b"", raw)
+                      if clean.strip() == b"":
+                          log("PAYLOAD-FILE-DELETED", rel, "file contained only the payload"); delete(path)
+                      else:
+                          log("REVIEW-BY-HAND", rel, "A10 payload inside a non-JS file")
+                  elif MARKERS.search(raw) or (ext in REVIEW_EXT and BADCMD.search(raw.decode("utf-8", "replace"))):
+                      log("REVIEW-BY-HAND", rel, "suspicious marker/command")
+
+          sys.exit(0 if not found else 3)
+          PY
+          echo "scanner written"
+
+      - name: Clean and verify (your account, every repo, every branch, every file)
+        shell: bash
+        run: |
+          set +e
+          echo "== token check (should print your username) =="
+          OWNER=$(gh api user --jq '.login')
+          echo "$OWNER"
+          echo "==========================================="
+          git config --global user.name  "security-cleanup"
+          git config --global user.email "security-cleanup@users.noreply.github.com"
+          git config --global core.hooksPath /dev/null     # never run hooks from an infected repo
+          export GIT_TERMINAL_PROMPT=0
+          REPORT=/tmp/report.txt; : > "$REPORT"
+
+          if [ "$INCLUDE_PRIVATE" = "true" ]; then
+            VIS_FILTER='true'
+          else
+            VIS_FILTER='(.private==false)'
+          fi
+
+          gh api "user/repos?per_page=100&affiliation=owner&type=all" --paginate \
+            --jq ".[] | select(.archived==false) | select($VIS_FILTER) | .name" > /tmp/repos.txt
+
+          while IFS= read -r repo; do
+            if [ -n "$REPO_FILTER" ] && ! printf '%s' "$repo" | grep -Eq "$REPO_FILTER"; then continue; fi
+            echo "################ $repo ################"
+            rm -rf /tmp/work
+            if ! git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/$OWNER/$repo.git" /tmp/work 2>/tmp/clone.err; then
+              echo "CLONE-FAILED: $repo :: $(head -c 200 /tmp/clone.err)" | tee -a "$REPORT"; continue
+            fi
+            cd /tmp/work || continue
+
+            for branch in $(git branch -r | grep -v -- '->' | sed 's#^ *origin/##'); do
+              git checkout -q -B "$branch" "origin/$branch" 2>/dev/null || { echo "CHECKOUT-FAILED: $repo@$branch" | tee -a "$REPORT"; continue; }
+              echo "-- $repo@$branch"
+
+              python3 /tmp/scan.py . "$repo" "$branch" "$DRY" "$NUKE_VSCODE" | tee -a "$REPORT"
+
+              if [ "$DRY" != "true" ] && [ -n "$(git status --porcelain)" ]; then
+                git add -A
+                git commit -q -m "security: remove malware payloads (.vscode folderOpen task, fake font, appended JS, gitignore, bot files)"
+                # verify BEFORE pushing: re-scan in dry mode must be silent
+                if python3 /tmp/scan.py . "$repo" "$branch" true "$NUKE_VSCODE" >/tmp/verify.txt; then
+                  if git push -q origin "$branch" 2>/tmp/push.err; then
+                    echo "FIXED+VERIFIED+PUSHED: $repo@$branch" | tee -a "$REPORT"
+                  else
+                    echo "PUSH-FAILED: $repo@$branch :: $(head -c 200 /tmp/push.err | tr '\n' ' ')  (branch protection? token needs contents:write)" | tee -a "$REPORT"
+                  fi
+                else
+                  echo "STILL-DIRTY-NOT-PUSHED: $repo@$branch" | tee -a "$REPORT"
+                  sed 's/^/    /' /tmp/verify.txt | tee -a "$REPORT"
+                fi
+              fi
+            done
+            cd /tmp
+          done < /tmp/repos.txt
+
+          echo
+          echo "=================== SUMMARY (DRY=$DRY) ==================="
+          sed 's/:.*//' "$REPORT" | sort | uniq -c | sort -rn
+          echo
+          echo "--- items that need your eyes ---"
+          grep -E 'REVIEW-BY-HAND|STILL-DIRTY|PUSH-FAILED|CLONE-FAILED|UNPARSEABLE|WHOLE-FILE' "$REPORT" || echo "(none)"
+          echo "Done. DRY=$DRY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: malware-scan-report
+          path: /tmp/report.txt
